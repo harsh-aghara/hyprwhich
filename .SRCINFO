@@ -1,0 +1,19 @@
+pkgbase = hyprwhich
+	pkgdesc = Wayland Layer-Shell keybinding HUD and lookup tool for Hyprland
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/harsh-aghara/hyprwhich
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = rust
+	depends = gtk3
+	depends = gtk-layer-shell
+	optdepends = rofi-wayland: Rofi launcher integration
+	optdepends = wl-clipboard: Clipboard copy support (Ctrl+C)
+	optdepends = libnotify: Desktop notifications for copied keybinds
+	source = hyprwhich-1.0.0.tar.gz::https://github.com/harsh-aghara/hyprwhich/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = d8cd14836e9a72d035b2a7a4d0d66d838da14824ef837bcf090a9b6a2c40fb29
+
+pkgname = hyprwhich

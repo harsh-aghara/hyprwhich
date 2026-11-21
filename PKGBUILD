@@ -14,7 +14,7 @@ optdepends=(
     'libnotify: Desktop notifications for copied keybinds'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('d8cd14836e9a72d035b2a7a4d0d66d838da14824ef837bcf090a9b6a2c40fb29')
 
 prepare() {
     cd "$srcdir/$pkgname-$pkgver"
