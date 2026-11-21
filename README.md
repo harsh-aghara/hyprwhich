@@ -6,6 +6,16 @@ A Wayland Layer-Shell HUD and keybinding lookup tool for Hyprland, written in Ru
 
 ---
 
+## Previews
+
+![Dark Mode HUD](assets/dark_hud.png)
+*Dark mode (Wallust palette)*
+
+![Light Mode HUD](assets/light_hud.png)
+*Light mode (high-contrast)*
+
+---
+
 ## Features
 
 - **Fast startup**: Standalone compiled Rust binary using `gtk-layer-shell`. Opens in ~15ms with low resource usage.
@@ -111,6 +121,9 @@ hyprwhich/
 ├── PKGBUILD
 ├── install.sh
 ├── README.md
+├── assets/
+│   ├── dark_hud.png
+│   └── light_hud.png
 └── src/
     ├── main.rs     # CLI options, benchmarks, entrypoint
     ├── config.rs   # Parser (.conf and .lua), variable expansion
