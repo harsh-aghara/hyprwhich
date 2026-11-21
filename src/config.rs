@@ -729,6 +729,598 @@ fn is_custom_action(is_user_config: bool, disp: &str, arg: &str, desc: &str) -> 
 
 /// Splits a string by delimiter, ignoring delimiters inside single/double quotes,
 /// parentheses, brackets, and braces.
+pub fn split_top_level(s: &str, delimiter: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut escape = false;
+
+    for c in s.chars() {
+        if escape {
+            cur.push(c);
+            escape = false;
+            continue;
+        }
+
+        if c == '\\' {
+            cur.push(c);
+            escape = true;
+            continue;
+        }
+
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            cur.push(c);
+        } else if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            cur.push(c);
+        } else if !in_single_quote && !in_double_quote {
+            match c {
+                '(' => {
+                    paren_depth += 1;
+                    cur.push(c);
+                }
+                ')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    cur.push(c);
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    cur.push(c);
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    cur.push(c);
+                }
+                '{' => {
+                    brace_depth += 1;
+                    cur.push(c);
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    cur.push(c);
+                }
+                _ if c == delimiter && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                    parts.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+
+    if !cur.is_empty() || !parts.is_empty() {
+        parts.push(cur.trim().to_string());
+    }
+
+    parts
+}
+
+/// Given a call like `hl.dsp.exec_cmd(os.getenv("HOME") .. "/face.sh")` or `exec_cmd(...)`,
+/// extracts the dispatcher name (e.g. "exec_cmd") and the content inside the balanced `(...)`.
+pub fn extract_balanced_call(s: &str) -> Option<(String, String)> {
+    let trimmed = s.trim();
+    let open_idx = trimmed.find('(')?;
+    let prefix = trimmed[..open_idx].trim();
+    let disp_name = if let Some(dot_idx) = prefix.rfind('.') {
+        &prefix[dot_idx + 1..]
+    } else {
+        prefix
+    };
+
+    let tail = &trimmed[open_idx + 1..];
+    let mut depth = 1usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let mut end_idx = None;
+
+    for (i, c) in tail.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    let inside = match end_idx {
+        Some(i) => &tail[..i],
+        None => tail.trim_end_matches(')'),
+    };
+
+    Some((disp_name.trim().to_string(), inside.trim().to_string()))
+}
+
+/// Normalizes Lua expressions including os.getenv, variable replacements, and string concatenations.
+pub fn normalize_lua_expr(expr: &str) -> String {
+    let mut res = expr.to_string();
+
+    // 1. Expand os.getenv("HOME") or os.getenv('HOME')
+    res = res
+        .replace("os.getenv(\"HOME\")", "~")
+        .replace("os.getenv('HOME')", "~")
+        .replace("os.getenv(\"USER\")", &env::var("USER").unwrap_or_default())
+        .replace("os.getenv('USER')", &env::var("USER").unwrap_or_default());
+
+    // Expand any other os.getenv("FOO")
+    while let Some(start) = res.find("os.getenv(") {
+        let after = &res[start + 10..];
+        if let Some(close) = after.find(')') {
+            let var_name = after[..close].trim().trim_matches(|c| c == '"' || c == '\'');
+            let val = env::var(var_name).unwrap_or_default();
+            res = format!("{}{}{}", &res[..start], val, &after[close + 1..]);
+        } else {
+            break;
+        }
+    }
+
+    // 2. Variable substitutions
+    res = res
+        .replace("scriptsDir", "~/.config/hypr/scripts")
+        .replace("userScripts", "~/.config/hypr/UserScripts")
+        .replace("UserConfigs", "~/.config/hypr/UserConfigs")
+        .replace("configs", "~/.config/hypr/configs")
+        .replace("mainMod", "SUPER")
+        .replace("\\\"", "\"")
+        .replace("\\'", "'");
+
+    // 3. Evaluate Lua string concatenations (..)
+    if res.contains("..") {
+        let parts: Vec<&str> = res.split("..").collect();
+        let mut combined = String::new();
+        for p in parts {
+            let clean = p.trim().trim_matches(|c| c == '"' || c == '\'');
+            combined.push_str(clean);
+        }
+        res = combined;
+    }
+
+    res.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string()
+}
+
+/// Extracts optional desc/description field from Lua options table: { desc = "Foo", locked = true }
+pub fn extract_desc_from_lua_table(table_str: &str) -> Option<String> {
+    for key in &["desc", "description"] {
+        if let Some(pos) = table_str.find(key) {
+            let after = &table_str[pos + key.len()..];
+            if let Some(eq_pos) = after.find('=') {
+                let rest = after[eq_pos + 1..].trim();
+                let mut chars = rest.chars();
+                if let Some(quote) = chars.next() {
+                    if quote == '"' || quote == '\'' {
+                        let inside = &rest[1..];
+                        if let Some(close_pos) = inside.find(quote) {
+                            return Some(inside[..close_pos].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parses a line of Lua keybind, e.g.:
+/// hl.bind(mainMod .. " + Escape", hl.dsp.exec_cmd(os.getenv("HOME") .. "/face_unlock.sh"), { locked = true })
+pub fn parse_lua_bind_line(line: &str) -> Option<(Vec<String>, String, String, String, Option<String>)> {
+    let trimmed = line.trim();
+    let is_lua_bind = trimmed.starts_with("hl.bind(")
+        || trimmed.starts_with("hl.bind (")
+        || trimmed.starts_with("hypr.bind(")
+        || (trimmed.starts_with("bind(") && !trimmed.starts_with("bind ="));
+
+    if !is_lua_bind {
+        return None;
+    }
+
+    let open_idx = trimmed.find('(')?;
+    let tail = &trimmed[open_idx + 1..];
+    let mut depth = 1usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let mut end_idx = None;
+
+    for (i, c) in tail.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    let inner = match end_idx {
+        Some(i) => &tail[..i],
+        None => tail.trim_end_matches(')'),
+    };
+
+    let args = split_top_level(inner, ',');
+    if args.len() < 2 {
+        return None;
+    }
+
+    // Arg 0: Combo
+    let raw_combo = normalize_lua_expr(&args[0]);
+    let tokens: Vec<&str> = raw_combo.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let key = normalize_key(tokens[tokens.len() - 1]);
+    let mods_str = tokens[..tokens.len() - 1].join(" ");
+    let mods = normalize_mods(&mods_str);
+
+    // Arg 1: Dispatcher
+    let (dsp_type, raw_arg) = extract_balanced_call(&args[1])?;
+    let normalized_arg = normalize_lua_expr(&raw_arg);
+
+    // Arg 2 (optional): Options table
+    let table_desc = if args.len() > 2 {
+        extract_desc_from_lua_table(&args[2])
+    } else {
+        None
+    };
+
+    Some((mods, key, dsp_type, normalized_arg, table_desc))
+}
+
+pub fn is_user_config_path(path: &Path) -> bool {
+    let s = path.to_string_lossy().to_lowercase();
+    if s.contains("/configs/") || s.contains("/etc/hypr/") || s.contains("/base/") {
+        return false;
+    }
+    true
+}
+
+pub fn config_file_priority(path: &Path) -> (u8, String) {
+    let s = path.to_string_lossy().to_lowercase();
+    let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("").to_lowercase();
+
+    let prio = if s.contains("/configs/") || s.contains("/etc/") || s.contains("/base/") {
+        4
+    } else if s.contains("userconfig")
+        || s.contains("/custom/")
+        || s.contains("/conf.d/")
+        || s.contains("override")
+        || file_name.starts_with("user")
+        || file_name.starts_with("my_")
+        || file_name.starts_with("custom")
+    {
+        0
+    } else if file_name.contains("keybind") || file_name.contains("bind") {
+        1
+    } else if file_name == "hyprland.conf" || file_name == "hyprland.lua" {
+        2
+    } else {
+        3
+    };
+
+    (prio, s)
+}
+
+pub fn discover_all_config_files(hypr_dir: &Path) -> Vec<(PathBuf, bool)> {
+    let mut discovered: HashSet<PathBuf> = HashSet::new();
+    let mut queue = vec![hypr_dir.to_path_buf()];
+
+    // 1. Recursive directory walk up to depth 4
+    let mut depth_map: HashMap<PathBuf, usize> = HashMap::new();
+    depth_map.insert(hypr_dir.to_path_buf(), 0);
+
+    while let Some(current_dir) = queue.pop() {
+        let current_depth = depth_map.get(&current_dir).copied().unwrap_or(0);
+        if current_depth >= 4 {
+            continue;
+        }
+
+        let entries = match fs::read_dir(&current_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "target" || name == "build" || name == "node_modules" {
+                continue;
+            }
+
+            if path.is_dir() {
+                depth_map.insert(path.clone(), current_depth + 1);
+                queue.push(path);
+            } else if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "conf" || ext == "lua" {
+                        discovered.insert(path);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Also follow source = directives in any .conf files
+    let existing_files: Vec<PathBuf> = discovered.iter().cloned().collect();
+    for conf_path in existing_files {
+        if conf_path.extension().and_then(|e| e.to_str()) == Some("conf") {
+            if let Ok(file) = File::open(&conf_path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("source") {
+                        if let Some(eq_idx) = trimmed.find('=') {
+                            let raw_target = trimmed[eq_idx + 1..].trim();
+                            let expanded = expand_hypr_cmd(raw_target);
+                            let target_path = PathBuf::from(&expanded);
+                            if target_path.exists() && target_path.is_file() {
+                                discovered.insert(target_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: check /etc/hypr/hyprland.conf if discovered list is empty
+    if discovered.is_empty() {
+        let etc_hypr = PathBuf::from("/etc/hypr/hyprland.conf");
+        if etc_hypr.exists() {
+            discovered.insert(etc_hypr);
+        }
+    }
+
+    // 4. Convert to Vec with priority and is_user_config flag
+    let mut file_list: Vec<(PathBuf, bool, u8, String)> = discovered
+        .into_iter()
+        .map(|p| {
+            let (prio, sort_key) = config_file_priority(&p);
+            let is_user = is_user_config_path(&p);
+            (p, is_user, prio, sort_key)
+        })
+        .collect();
+
+    file_list.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.3.cmp(&b.3)));
+
+    file_list.into_iter().map(|(p, is_user, _, _)| (p, is_user)).collect()
+}
+
+pub fn parse_all_configs() -> Vec<Keybind> {
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs_fallback().join(".config"));
+    let hypr_dir = config_home.join("hypr");
+
+    let files = discover_all_config_files(&hypr_dir);
+
+    let mut all_binds = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (fpath, is_user_config) in &files {
+        if !fpath.exists() {
+            continue;
+        }
+
+        let file = match File::open(fpath) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+
+        let mut pending_comment: Option<String> = None;
+        let mut conf_vars: HashMap<String, String> = HashMap::new();
+
+        for line in reader.lines().flatten() {
+            let line = line.trim();
+            if line.is_empty() {
+                pending_comment = None;
+                continue;
+            }
+
+            // Check comment line
+            if line.starts_with('#') || line.starts_with("--") || line.starts_with("//") {
+                let stripped = line.trim_start_matches(|c| c == '#' || c == '-' || c == '/').trim();
+                if !stripped.is_empty() && stripped.chars().any(|c| c.is_alphanumeric()) {
+                    pending_comment = Some(stripped.to_string());
+                }
+                continue;
+            }
+
+            // Check variable definition in .conf ($foo = bar)
+            if line.starts_with('$') && !line.starts_with("$mainMod") {
+                if let Some(eq_idx) = line.find('=') {
+                    let var_name = line[..eq_idx].trim().to_string();
+                    let var_val = line[eq_idx + 1..].trim().to_string();
+                    conf_vars.insert(var_name, var_val);
+                    pending_comment = None;
+                    continue;
+                }
+            }
+
+            // 1. Parse .conf syntax: bind[flags] = MOD, KEY, ...
+            if let Some(idx) = line.find('=') {
+                let (prefix, rest) = line.split_at(idx);
+                let flag = prefix.trim().to_lowercase();
+                if flag.starts_with("bind") {
+                    let mut rest_str = rest[1..].trim().to_string();
+
+                    // Expand conf variables
+                    for (k, v) in &conf_vars {
+                        if rest_str.contains(k) {
+                            rest_str = rest_str.replace(k, v);
+                        }
+                    }
+                    rest_str = expand_hypr_cmd(&rest_str);
+
+                    let (clean_rest, inline_cmt) = if let Some(h_idx) = rest_str.find('#') {
+                        (rest_str[..h_idx].trim().to_string(), rest_str[h_idx + 1..].trim().to_string())
+                    } else {
+                        (rest_str, String::new())
+                    };
+
+                    let parts: Vec<&str> = clean_rest.split(',').map(|s| s.trim()).collect();
+                    if parts.len() >= 2 {
+                        let raw_mods = parts[0];
+                        let raw_key = parts[1];
+                        let mods = normalize_mods(raw_mods);
+                        let key = normalize_key(raw_key);
+
+                        let has_desc = flag.contains('d') && flag != "bind";
+                        let (desc, disp, arg) = if has_desc {
+                            let d = parts.get(2).copied().unwrap_or("");
+                            let disp = parts.get(3).copied().unwrap_or("");
+                            let arg = if parts.len() > 4 { parts[4..].join(",") } else { String::new() };
+                            (d, disp, arg)
+                        } else {
+                            let disp = parts.get(2).copied().unwrap_or("");
+                            let arg = if parts.len() > 3 { parts[3..].join(",") } else { String::new() };
+                            ("", disp, arg)
+                        };
+
+                        let effective_desc = if !desc.is_empty() {
+                            desc.to_string()
+                        } else if !inline_cmt.is_empty() {
+                            inline_cmt
+                        } else {
+                            pending_comment.take().unwrap_or_default()
+                        };
+
+                        let (eff_disp, eff_arg) = if (disp == "exec" || disp == "execr" || disp == "exec_cmd") && arg.starts_with("hyprctl dispatch ") {
+                            let remainder = arg[17..].trim();
+                            let mut parts = remainder.splitn(2, ' ');
+                            (parts.next().unwrap_or(disp), parts.next().unwrap_or("").to_string())
+                        } else {
+                            (disp, arg.clone())
+                        };
+
+                        let (final_desc, mut cat) = humanize_dispatcher_ext(eff_disp, &eff_arg, &effective_desc, has_desc);
+
+                        let is_truly_custom = is_custom_action(*is_user_config, disp, &arg, &final_desc);
+                        if is_truly_custom {
+                            cat = "[Custom]".to_string();
+                        }
+
+                        let key_id = (mods.join(" + "), key.clone());
+                        if !seen.contains(&key_id) {
+                            seen.insert(key_id);
+                            all_binds.push(Keybind {
+                                mods,
+                                key,
+                                desc: final_desc,
+                                category: cat,
+                                dispatcher: disp.to_string(),
+                                arg,
+                                is_custom: is_truly_custom,
+                                source: fpath.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // 2. Parse .lua syntax: hl.bind(...)
+            if let Some((mods, key, dsp_type, normalized_arg, table_desc)) = parse_lua_bind_line(line) {
+                let is_explicit = table_desc.is_some();
+                let effective_desc = if let Some(d) = table_desc {
+                    d
+                } else {
+                    pending_comment.take().unwrap_or_default()
+                };
+
+                let (eff_disp, eff_arg) = if (dsp_type == "exec" || dsp_type == "execr" || dsp_type == "exec_cmd") && normalized_arg.starts_with("hyprctl dispatch ") {
+                    let remainder = normalized_arg[17..].trim();
+                    let mut parts = remainder.splitn(2, ' ');
+                    (parts.next().unwrap_or(&dsp_type).to_string(), parts.next().unwrap_or("").to_string())
+                } else {
+                    (dsp_type.clone(), normalized_arg.clone())
+                };
+
+                let (final_desc, mut cat) = humanize_dispatcher_ext(&eff_disp, &eff_arg, &effective_desc, is_explicit);
+                let is_truly_custom = is_custom_action(*is_user_config, &dsp_type, &normalized_arg, &final_desc);
+                if is_truly_custom {
+                    cat = "[Custom]".to_string();
+                }
+
+                let key_id = (mods.join(" + "), key.clone());
+                if !seen.contains(&key_id) {
+                    seen.insert(key_id);
+                    all_binds.push(Keybind {
+                        mods,
+                        key,
+                        desc: final_desc,
+                        category: cat,
+                        dispatcher: dsp_type,
+                        arg: normalized_arg,
+                        is_custom: is_truly_custom,
+                        source: fpath.file_name().and_then(|f| f.to_str()).unwrap_or("").to_string(),
+                    });
+                }
+                continue;
+            }
+
+            // Non-bind code line resets pending comment
+            pending_comment = None;
+        }
+    }
+
+    let mut filtered: Vec<Keybind> = all_binds
+        .into_iter()
+        .filter(|b| {
+            let kl = b.key.to_lowercase();
+            !kl.contains("switch") && kl != "xf86launch1" && kl != "xf86launch3" && kl != "xf86launch4"
+        })
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        let prio_a = if a.is_custom { 0 } else { 1 };
+        let prio_b = if b.is_custom { 0 } else { 1 };
+        prio_a.cmp(&prio_b)
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| a.desc.cmp(&b.desc))
+    });
+
+    filtered
+}
 
 #[cfg(test)]
 mod tests {
@@ -765,12 +1357,151 @@ mod tests {
             humanize_dispatcher("fullscreen", "1", ""),
             ("Maximize Window".to_string(), "[Window]".to_string())
         );
+        assert_eq!(
+            humanize_dispatcher("changegroupactive", "f", ""),
+            ("Next Tab in Group".to_string(), "[Window]".to_string())
+        );
+        assert_eq!(
+            humanize_dispatcher("changegroupactive", "b", ""),
+            ("Previous Tab in Group".to_string(), "[Window]".to_string())
+        );
+        assert_eq!(
+            humanize_dispatcher("workspace", "+1", ""),
+            ("Next Workspace".to_string(), "[Workspace]".to_string())
+        );
+        assert_eq!(
+            humanize_dispatcher("movetoworkspacesilent", "3", ""),
+            ("Move Window to Workspace 3 (Silent)".to_string(), "[Workspace]".to_string())
+        );
+        assert_eq!(
+            humanize_dispatcher("movefocus", "l", ""),
+            ("Focus Window Left".to_string(), "[Window]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_humanize_exec_dynamic() {
+        // Dynamic commands without static maps
+        let (desc, cat) = humanize_dispatcher("exec", "foot", "");
+        assert_eq!(desc, "Terminal (Foot)");
+        assert_eq!(cat, "[Apps]");
+
+        let (desc, cat) = humanize_dispatcher("exec", "dolphin", "");
+        assert_eq!(desc, "File Manager (Dolphin)");
+        assert_eq!(cat, "[Apps]");
+
+        let (desc, cat) = humanize_dispatcher("exec", "zen-browser", "");
+        assert_eq!(desc, "Web Browser (Zen Browser)");
+        assert_eq!(cat, "[Apps]");
+
+        let (desc, cat) = humanize_dispatcher("exec", "playerctl play-pause", "");
+        assert_eq!(desc, "Play / Pause Audio");
+        assert_eq!(cat, "[Media]");
+
+        let (desc, cat) = humanize_dispatcher("exec", "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+", "");
+        assert_eq!(desc, "Increase Audio Volume");
+        assert_eq!(cat, "[Media]");
+
+        let (desc, cat) = humanize_dispatcher("exec", "screenshot.sh --active", "");
+        assert_eq!(desc, "Screenshot (Active Window)");
+        assert_eq!(cat, "[Screenshot]");
+
+        // Arbitrary unknown user script decomposed algorithmically
+        let (desc, _) = humanize_dispatcher("exec", "~/.config/hypr/scripts/my_backup_photos.sh --quick", "");
+        assert_eq!(desc, "My Backup Photos");
+
+        let (desc2, _) = humanize_dispatcher("exec", "toggle-presentation-mode.sh", "");
+        assert_eq!(desc2, "Toggle Presentation Mode");
     }
 
     #[test]
     fn test_split_identifier_words() {
         assert_eq!(split_identifier_words("my_cool_script.sh"), "My Cool Script");
         assert_eq!(split_identifier_words("toggle-feature"), "Toggle Feature");
+        assert_eq!(split_identifier_words("rofiEmoji"), "Rofi Emoji");
         assert_eq!(split_identifier_words("face_unlock"), "Face Unlock");
+    }
+
+    #[test]
+    fn test_custom_action_detection() {
+        assert!(is_custom_action(true, "exec", "~/.config/hypr/scripts/custom_tool.sh", "Custom Tool"));
+        assert!(!is_custom_action(false, "exec", "~/.config/hypr/scripts/custom_tool.sh", "Custom Tool"));
+        assert!(!is_custom_action(true, "workspace", "1", "Switch to Workspace 1"));
+    }
+
+    #[test]
+    fn test_split_top_level() {
+        let input = r#"mainMod .. " + Escape", hl.dsp.exec_cmd(os.getenv("HOME") .. "/face_unlock.sh"), { locked = true }"#;
+        let parts = split_top_level(input, ',');
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], r#"mainMod .. " + Escape""#);
+        assert_eq!(parts[1], r#"hl.dsp.exec_cmd(os.getenv("HOME") .. "/face_unlock.sh")"#);
+        assert_eq!(parts[2], r#"{ locked = true }"#);
+    }
+
+    #[test]
+    fn test_extract_balanced_call() {
+        let input = r#"hl.dsp.exec_cmd(os.getenv("HOME") .. "/.config/hypr/hyprlock/face_unlock.sh")"#;
+        let (dsp, inside) = extract_balanced_call(input).unwrap();
+        assert_eq!(dsp, "exec_cmd");
+        assert_eq!(inside, r#"os.getenv("HOME") .. "/.config/hypr/hyprlock/face_unlock.sh""#);
+
+        let input_simple = "hl.dsp.killactive()";
+        let (dsp, inside) = extract_balanced_call(input_simple).unwrap();
+        assert_eq!(dsp, "killactive");
+        assert_eq!(inside, "");
+    }
+
+    #[test]
+    fn test_normalize_lua_expr() {
+        let expr = r#"os.getenv("HOME") .. "/.config/hypr/hyprlock/face_unlock.sh""#;
+        let res = normalize_lua_expr(expr);
+        assert_eq!(res, "~/.config/hypr/hyprlock/face_unlock.sh");
+
+        let expr_scripts = r#"scriptsDir .. "/ScreenShot.sh""#;
+        let res_scripts = normalize_lua_expr(expr_scripts);
+        assert_eq!(res_scripts, "~/.config/hypr/scripts/ScreenShot.sh");
+    }
+
+    #[test]
+    fn test_parse_lua_bind_line() {
+        let line = r#"hl.bind(mainMod .. " + Escape", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.config/hypr/hyprlock/face_unlock.sh"), { locked = true })"#;
+        let (mods, key, dsp, arg, desc) = parse_lua_bind_line(line).unwrap();
+        assert_eq!(mods, vec!["SUPER"]);
+        assert_eq!(key, "Esc");
+        assert_eq!(dsp, "exec_cmd");
+        assert_eq!(arg, "~/.config/hypr/hyprlock/face_unlock.sh");
+        assert_eq!(desc, None);
+
+        let (final_desc, _) = humanize_dispatcher(&dsp, &arg, "Gaze On-Demand Facial Authentication (Lock Screen)");
+        assert_eq!(final_desc, "Gaze On-Demand Facial Authentication (Lock Screen)");
+        assert!(is_custom_action(true, &dsp, &arg, &final_desc));
+    }
+
+    #[test]
+    fn test_hyprctl_dispatch_unwrap() {
+        let (desc, cat) = humanize_dispatcher("exec_cmd", "hyprctl dispatch movecurrentworkspacetomonitor l", "");
+        assert_eq!(desc, "Move Workspace to Monitor Left");
+        assert_eq!(cat, "[Workspace]");
+    }
+
+    #[test]
+    fn test_config_file_priority() {
+        let p_user = Path::new("/home/user/.config/hypr/UserConfigs/UserKeybinds.lua");
+        let p_custom = Path::new("/home/user/.config/hypr/custom/keys.conf");
+        let p_conf_d = Path::new("/home/user/.config/hypr/conf.d/test.conf");
+        let p_main = Path::new("/home/user/.config/hypr/hyprland.lua");
+        let p_base = Path::new("/home/user/.config/hypr/configs/Keybinds.lua");
+
+        assert_eq!(config_file_priority(p_user).0, 0);
+        assert_eq!(config_file_priority(p_custom).0, 0);
+        assert_eq!(config_file_priority(p_conf_d).0, 0);
+        assert_eq!(config_file_priority(p_main).0, 2);
+        assert_eq!(config_file_priority(p_base).0, 4);
+
+        assert!(is_user_config_path(p_user));
+        assert!(is_user_config_path(p_custom));
+        assert!(is_user_config_path(p_conf_d));
+        assert!(!is_user_config_path(p_base));
     }
 }
