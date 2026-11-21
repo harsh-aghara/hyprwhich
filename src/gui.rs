@@ -480,25 +480,39 @@ impl HudState {
     }
 
     fn execute_bind(&self, bind: &Keybind) {
+        // 1. Immediately drop exclusive keyboard grab and close HUD
+        self.window.set_keyboard_mode(KeyboardMode::None);
+        self.window.hide();
         self.window.close();
-        let disp = &bind.dispatcher;
-        let raw_arg = &bind.arg;
-        let expanded_arg = expand_hypr_cmd(raw_arg);
+        gtk::main_quit();
 
-        if disp.eq_ignore_ascii_case("exec") {
-            let _ = Command::new("hyprctl")
-                .args(["dispatch", "exec", &expanded_arg])
-                .spawn();
-            let _ = Command::new("sh")
-                .args(["-c", &expanded_arg])
-                .spawn();
-        } else if !disp.is_empty() {
-            let mut cmd = Command::new("hyprctl");
-            cmd.arg("dispatch").arg(disp);
-            if !expanded_arg.is_empty() {
-                cmd.arg(&expanded_arg);
+        let disp = bind.dispatcher.trim();
+        let raw_arg = bind.arg.trim();
+        let mut expanded_arg = expand_hypr_cmd(raw_arg);
+
+        if expanded_arg.starts_with('~') {
+            if let Ok(home) = std::env::var("HOME") {
+                expanded_arg = expanded_arg.replacen('~', &home, 1);
             }
-            let _ = cmd.spawn();
+        }
+
+        let dl = disp.to_lowercase();
+        let is_exec = dl == "exec" || dl == "exec_cmd" || dl == "execr" || dl == "exec_raw" || dl.is_empty();
+
+        if is_exec {
+            // Check if the argument is an internal hyprctl dispatch command
+            if expanded_arg.starts_with("hyprctl dispatch ") {
+                let inner = expanded_arg.trim_start_matches("hyprctl dispatch ").trim();
+                let mut parts = inner.splitn(2, ' ');
+                let inner_disp = parts.next().unwrap_or("");
+                let inner_arg = parts.next().unwrap_or("");
+                dispatch_hypr_action(inner_disp, inner_arg);
+                return;
+            }
+
+            dispatch_exec(&expanded_arg);
+        } else {
+            dispatch_hypr_action(disp, &expanded_arg);
         }
     }
 
@@ -510,6 +524,111 @@ impl HudState {
             .args(["-a", "hyprwhich", "Copied Keybind", text])
             .spawn();
     }
+}
+
+fn escape_lua(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 10);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn dispatch_exec(cmd_str: &str) {
+    // 1. Try Hyprland 0.57+ Lua dispatch
+    let lua_call = format!("hl.dsp.exec_cmd(\"{}\")", escape_lua(cmd_str));
+    let status = Command::new("hyprctl")
+        .args(["dispatch", &lua_call])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if let Ok(st) = status {
+        if st.success() {
+            return;
+        }
+    }
+
+    // 2. Fallback to classic Hyprland dispatch exec (<0.57)
+    let status_classic = Command::new("hyprctl")
+        .args(["dispatch", "exec", cmd_str])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if let Ok(st) = status_classic {
+        if st.success() {
+            return;
+        }
+    }
+
+    // 3. Fallback to detached POSIX shell
+    let mut sh_cmd = Command::new("sh");
+    sh_cmd.arg("-c").arg(format!("{} &", cmd_str));
+    sh_cmd.stdin(std::process::Stdio::null());
+    sh_cmd.stdout(std::process::Stdio::null());
+    sh_cmd.stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        sh_cmd.process_group(0);
+    }
+    let _ = sh_cmd.spawn();
+}
+
+fn dispatch_hypr_action(disp: &str, arg: &str) {
+    let dl = disp.to_lowercase();
+    let al = arg.trim();
+
+    // 1. Try Hyprland 0.57+ Lua dispatch
+    let lua_call = match dl.as_str() {
+        "killactive" | "closewindow" => Some("hl.dsp.window.close()".to_string()),
+        "togglefloating" | "setfloating" => Some("hl.dsp.window.float()".to_string()),
+        "fullscreen" => Some(format!("hl.dsp.window.fullscreen({})", if al.is_empty() { "0" } else { al })),
+        "centerwindow" => Some("hl.dsp.window.center()".to_string()),
+        "pseudo" => Some("hl.dsp.window.pseudo()".to_string()),
+        "pin" => Some("hl.dsp.window.pin()".to_string()),
+        "togglespecialworkspace" => Some("hl.dsp.workspace.toggle_special()".to_string()),
+        "workspace" => Some(format!("hl.dsp.focus({{ workspace = \"{}\" }})", escape_lua(al))),
+        "movetoworkspace" => Some(format!("hl.dsp.window.move({{ workspace = \"{}\" }})", escape_lua(al))),
+        "movetoworkspacesilent" => Some(format!("hl.dsp.window.move({{ workspace = \"{}\", silent = true }})", escape_lua(al))),
+        _ => None,
+    };
+
+    if let Some(lua_code) = lua_call {
+        let status = Command::new("hyprctl")
+            .args(["dispatch", &lua_code])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if let Ok(st) = status {
+            if st.success() {
+                return;
+            }
+        }
+    }
+
+    // 2. Also run classic Hyprland dispatch
+    let mut cmd = Command::new("hyprctl");
+    cmd.arg("dispatch").arg(disp);
+    if !arg.is_empty() {
+        cmd.arg(arg);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
 }
 
 pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<String>) {
@@ -726,7 +845,6 @@ pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<
                 if let Some(next_row) = s.listbox.row_at_index(idx + 1) {
                     if next_row.is_selectable() {
                         s.listbox.select_row(Some(&next_row));
-                        next_row.grab_focus();
                         s.ensure_row_visible(&next_row);
                     }
                 }
@@ -740,7 +858,6 @@ pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<
                     if let Some(prev_row) = s.listbox.row_at_index(idx - 1) {
                         if prev_row.is_selectable() {
                             s.listbox.select_row(Some(&prev_row));
-                            prev_row.grab_focus();
                             s.ensure_row_visible(&prev_row);
                         }
                     }
@@ -773,6 +890,18 @@ pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<
                 return glib::Propagation::Stop;
             }
 
+            if keyval == keys::Tab {
+                let cur = *s.current_cat_idx.borrow();
+                let n = s.categories.len();
+                let next_idx = if state_mask.contains(ModifierType::SHIFT_MASK) {
+                    if cur == 0 { n - 1 } else { cur - 1 }
+                } else {
+                    (cur + 1) % n
+                };
+                s.set_active_category(next_idx);
+                return glib::Propagation::Stop;
+            }
+
             if state_mask.contains(ModifierType::CONTROL_MASK)
                 && (keyval == keys::c || keyval == keys::C)
             {
@@ -792,6 +921,32 @@ pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<
 
             if keyval == keys::Return || keyval == keys::KP_Enter {
                 s.execute_selected();
+                return glib::Propagation::Stop;
+            }
+
+            if keyval == keys::Down {
+                let opt_row = s.listbox.selected_row();
+                let idx = opt_row.map(|r| r.index()).unwrap_or(-1);
+                if let Some(next_row) = s.listbox.row_at_index(idx + 1) {
+                    if next_row.is_selectable() {
+                        s.listbox.select_row(Some(&next_row));
+                        s.ensure_row_visible(&next_row);
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+
+            if keyval == keys::Up {
+                let opt_row = s.listbox.selected_row();
+                let idx = opt_row.map(|r| r.index()).unwrap_or(0);
+                if idx > 0 {
+                    if let Some(prev_row) = s.listbox.row_at_index(idx - 1) {
+                        if prev_row.is_selectable() {
+                            s.listbox.select_row(Some(&prev_row));
+                            s.ensure_row_visible(&prev_row);
+                        }
+                    }
+                }
                 return glib::Propagation::Stop;
             }
 
@@ -816,7 +971,11 @@ pub fn run_gui(keybinds: Vec<Keybind>, force_light: bool, initial_query: Option<
         });
     }
 
-    // Wire window destroy
+    // Wire window destroy and delete-event
+    window.connect_delete_event(|_, _| {
+        gtk::main_quit();
+        glib::Propagation::Proceed
+    });
     window.connect_destroy(|_| {
         gtk::main_quit();
     });
@@ -852,5 +1011,12 @@ mod tests {
         let h = highlight_fuzzy(target, "actve");
         assert!(h.contains("<b><u>"));
         assert!(h.contains("</u></b>"));
+    }
+
+    #[test]
+    fn test_escape_lua() {
+        assert_eq!(escape_lua("simple_command"), "simple_command");
+        assert_eq!(escape_lua("notify-send \"hello\""), "notify-send \\\"hello\\\"");
+        assert_eq!(escape_lua("path\\to\\file"), "path\\\\to\\\\file");
     }
 }
