@@ -1,18 +1,24 @@
+<div align="center">
+
 # hyprwhich
 
-A Wayland Layer-Shell HUD and keybinding lookup tool for Hyprland, written in Rust.
+**A Wayland Layer-Shell HUD and keybinding lookup tool for Hyprland, written in Rust.**
 
-`hyprwhich` parses your Hyprland configuration files (`.conf` and `.lua`) and opens a fast, searchable overlay cheatsheet via Wayland Layer-Shell.
+<p>
+  <code>hyprwhich</code> parses your Hyprland configuration files (<code>.conf</code> and <code>.lua</code>) and opens a fast, searchable overlay cheatsheet via Wayland Layer-Shell.
+</p>
+
+<img src="assets/demo.gif" alt="hyprwhich Live Demo" width="90%" />
+
+</div>
 
 ---
 
 ## Previews
 
-![Dark Mode HUD](assets/dark_hud.png)
-*Dark mode (Wallust palette)*
-
-![Light Mode HUD](assets/light_hud.png)
-*Light mode (high-contrast)*
+| Dark Mode (Wallust palette) | Light Mode (High Contrast) |
+| :---: | :---: |
+| ![Dark Mode HUD](assets/dark_hud.png) | ![Light Mode HUD](assets/light_hud.png) |
 
 ---
 
@@ -118,11 +124,13 @@ hyprwhich --bench
 ```
 hyprwhich/
 ├── Cargo.toml
+├── LICENSE
 ├── PKGBUILD
 ├── install.sh
 ├── README.md
 ├── assets/
 │   ├── dark_hud.png
+│   ├── demo.gif
 │   └── light_hud.png
 └── src/
     ├── main.rs     # CLI options, benchmarks, entrypoint
@@ -135,4 +143,4 @@ hyprwhich/
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
