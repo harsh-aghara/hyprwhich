@@ -48,16 +48,18 @@
 
 ## Installation
 
-### Arch Linux (AUR)
+> **Note:** AUR package (`hyprwhich`) is coming soon! In the meantime, Arch users can install using `makepkg`, the automated installer script, or build from source below.
+
+### Arch Linux (makepkg)
 ```bash
-yay -S hyprwhich
-# or
-paru -S hyprwhich
+git clone https://github.com/harsh-aghara/hyprwhich.git
+cd hyprwhich
+makepkg -si
 ```
 
 ### Install script
 ```bash
-git clone https://github.com/hyprwhich/hyprwhich.git
+git clone https://github.com/harsh-aghara/hyprwhich.git
 cd hyprwhich
 ./install.sh
 
@@ -69,6 +71,8 @@ cd hyprwhich
 
 ### Build from source
 ```bash
+git clone https://github.com/harsh-aghara/hyprwhich.git
+cd hyprwhich
 cargo build --release
 install -Dm755 target/release/hyprwhich ~/.local/bin/hyprwhich
 ln -sf ~/.local/bin/hyprwhich ~/.local/bin/hyprwhich-gui
